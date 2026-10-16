@@ -794,7 +794,55 @@ class CacheAddObserver:
             )
 
 
+class ExactTemplateCacheObserver:
+    """(AgentSocietyExperiments fork) Saves the code of a successful template-mode ask under its
+    exact template text, so the next ask with the same template reuses it without a model call.
+
+    The code reads its changing values from ctx['variables'], so one saved program serves every
+    ask with that template. Only code written by the model and run successfully is saved."""
+
+    def __init__(self, router: "CodeGenRouter"):
+        self._router = router
+
+    async def on_final(self, context: AskContext) -> None:
+        r = self._router
+        if not r._exact_template_cache_enabled or not context.template_mode or context.is_observe_or_statistics:
+            return
+        key = (context.readonly, context.instruction_stripped)
+        if context.success_data is not None and context.code_source == "llm":
+            r._exact_template_codes.setdefault(key, context.success_data["code"])
+        if getattr(context, "_exact_owner", False):  # release asks waiting on this generation
+            ev = r._exact_template_inflight.pop(key, None)
+            if ev is not None:
+                ev.set()
+
+
 # --- Code Provider 责任链具体实现 ---
+
+
+class ExactTemplateCodeProvider:
+    """(AgentSocietyExperiments fork) Reuses saved code for a template-mode ask whose template
+    text is identical to one already handled successfully (see ExactTemplateCacheObserver).
+    Exact match only, with no embedding similarity."""
+
+    @property
+    def name(self) -> str:
+        return "exact_template"
+
+    async def get_code(self, context: AskContext, router: "CodeGenRouter") -> str | None:
+        if not router._exact_template_cache_enabled or not context.template_mode or context.is_observe_or_statistics:
+            return None
+        key = (context.readonly, context.instruction_stripped)
+        if key in router._exact_template_codes:
+            return router._exact_template_codes[key]
+        ev = router._exact_template_inflight.get(key)
+        if ev is None:  # first ask with this template: it generates; others wait for it
+            router._exact_template_inflight[key] = asyncio.Event()
+            context._exact_owner = True
+            return None
+        await ev.wait()
+        return router._exact_template_codes.get(key)  # None if that generation failed
+
 
 
 class PredefinedCodeProvider:
@@ -1635,6 +1683,8 @@ class CodeGenRouter(RouterBase):
         template_cache_max_size: int = 1000,  # 单 env 类型最大缓存条目数
         template_cache_dir: str
         | None = None,  # 缓存数据库目录，None 则用 {Config.HOME_DIR}/codegen_router_cache
+        # (fork) exact-template code reuse, in memory for the life of this router (one run)
+        exact_template_cache: bool = False,
         # Injected serializable LLM clients. See RouterBase.
         llm_clients_spec: dict[str, Any] | None = None,
     ):
@@ -1668,6 +1718,9 @@ class CodeGenRouter(RouterBase):
         # ==================== Template缓存相关 ====================
         self._final_summary_enabled = final_summary_enabled
         self._template_cache_enabled = template_cache_enabled
+        self._exact_template_cache_enabled = exact_template_cache
+        self._exact_template_codes: dict[tuple[bool, str], str] = {}
+        self._exact_template_inflight: dict[tuple[bool, str], asyncio.Event] = {}
         self._template_cache_similarity_threshold = template_cache_similarity_threshold
         self._template_cache_max_size = template_cache_max_size
 
@@ -1723,11 +1776,13 @@ class CodeGenRouter(RouterBase):
         self._observers: list[AskObserver] = [
             CacheStatsObserver(self),
             CacheAddObserver(self),
+            ExactTemplateCacheObserver(self),
         ]
 
         # Code 获取责任链：Predefined -> Cache -> LLM（LLM 在 pipeline 中单独处理）
         self._code_provider_chain: list[CodeProvider] = [
             PredefinedCodeProvider(),
+            ExactTemplateCodeProvider(),
             CacheCodeProvider(),
             LLMCodegenProvider(),
         ]

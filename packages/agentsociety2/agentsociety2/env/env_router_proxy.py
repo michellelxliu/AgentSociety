@@ -120,6 +120,7 @@ async def create_env_router_proxy(
     run_dir: str | Path | None = None,
     max_concurrency: int | None = None,
     final_summary_enabled: bool = False,
+    codegen_kwargs: dict[str, Any] | None = None,
 ) -> EnvRouterProxy:
     """Create a Ray ``EnvRouterProxy`` for examples / scripts (CLI-compatible).
 
@@ -176,7 +177,7 @@ async def create_env_router_proxy(
         types,
         kwargs,
         str(run_dir_path) if run_dir_path is not None else None,
-        {"final_summary_enabled": final_summary_enabled},
+        {"final_summary_enabled": final_summary_enabled, **(codegen_kwargs or {})},
         llm_clients_spec,
         None,
         None,
