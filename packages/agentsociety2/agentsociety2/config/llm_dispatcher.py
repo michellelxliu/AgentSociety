@@ -16,6 +16,10 @@ no global aggregate, no actor).
 
 from __future__ import annotations
 
+import uuid
+
+import json
+
 import asyncio
 import os
 import re
@@ -509,6 +513,41 @@ class ThinkingSettings:
         return kwargs
 
 
+# ═══════════════════════════════════════════════════════════
+# Per-call log (AgentSocietyExperiments fork)
+# ═══════════════════════════════════════════════════════════
+# When AGENTSOCIETY_CALL_LOG_DIR is set, every attempt of LLMClient.call is
+# appended as one JSON line to <dir>/engine_calls_<pid>.jsonl: request
+# messages and kwargs, full response (incl. reasoning_content and logprobs when
+# the endpoint returns them), latency, attempt number, error. When
+# AGENTSOCIETY_LLM_LOGPROBS=<k> is set (k >= 1), top-k logprobs are requested
+# unless the caller set them; set it only for endpoints that support logprobs.
+
+
+def _call_log_write(record: dict) -> None:
+    log_dir = os.environ.get("AGENTSOCIETY_CALL_LOG_DIR")
+    if not log_dir:
+        return
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        line = (json.dumps(record, ensure_ascii=False, default=str) + "\n").encode()
+        fd = os.open(os.path.join(log_dir, f"engine_calls_{os.getpid()}.jsonl"),
+                     os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        try:
+            os.write(fd, line)
+        finally:
+            os.close(fd)
+    except Exception:  # logging must never break a run
+        logger.debug("call log write failed", exc_info=True)
+
+
+def _response_dump(response: Any) -> Any:
+    try:
+        return response.model_dump(mode="json")
+    except Exception:
+        return repr(response)
+
+
 @dataclass
 class LLMClient:
     """Serializable LLM connection config that builds its runtime per-loop.
@@ -684,6 +723,11 @@ class LLMClient:
         max_retries = max(max_retries, 1)
         effective_model = model or self.model_name
         request_kwargs = self._resolve_thinking_kwargs(thinking, kwargs)
+        _lp = os.environ.get("AGENTSOCIETY_LLM_LOGPROBS", "").strip()
+        if _lp.isdigit() and int(_lp) > 0 and "logprobs" not in request_kwargs:
+            request_kwargs["logprobs"] = True
+            request_kwargs["top_logprobs"] = int(_lp)
+        _call_id = uuid.uuid4().hex
         self._ensure_runtime()
         router = self._router
         sem = self._sem
@@ -706,9 +750,25 @@ class LLMClient:
                 latency_ms = (time.monotonic() - t0) * 1000
                 sem.record_latency(latency_ms, is_error=False)
                 self._record_tokens(effective_model, response)
+                _dump = _response_dump(response)
+                _msg = (_dump.get("choices") or [{}])[0].get("message", {}) if isinstance(_dump, dict) else {}
+                _call_log_write({
+                    "call_id": _call_id, "attempt": attempt + 1, "ts": time.time(), "role": self.model_type,
+                    "model": effective_model, "messages": messages, "request_kwargs": request_kwargs,
+                    "response": _dump, "latency_ms": latency_ms,
+                    "reasoning": _msg.get("reasoning_content"),
+                    "reasoning_status": "returned" if _msg.get("reasoning_content") else "none_returned",
+                    "logprobs_status": "returned" if (_dump.get("choices") or [{}])[0].get("logprobs") else
+                                       ("none_returned" if request_kwargs.get("logprobs") else "not_requested (endpoint unsupported)"),
+                })
                 return response
             except Exception as e:
                 latency_ms = (time.monotonic() - t0) * 1000
+                _call_log_write({
+                    "call_id": _call_id, "attempt": attempt + 1, "ts": time.time(), "role": self.model_type,
+                    "model": effective_model, "messages": messages, "request_kwargs": request_kwargs,
+                    "error": f"{type(e).__name__}: {e}", "latency_ms": latency_ms,
+                })
                 overloaded = is_rate_limit_like_error(e)
                 sem.record_latency(latency_ms, is_error=overloaded)
                 last_error = e
