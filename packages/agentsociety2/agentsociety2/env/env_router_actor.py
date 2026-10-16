@@ -122,6 +122,10 @@ def get_env_router_actor_class(max_concurrency: int = 1) -> Any:
             """从 workspace 恢复 env 模块状态（resume）。"""
             return await self._router.from_workspaces()
 
+        def export_programs(self) -> dict:
+            """(fork) See CodeGenRouter.export_programs."""
+            return self._router.export_programs()
+
         def set_current_time(self, t: datetime) -> None:
             self._router.set_current_time(t)
 

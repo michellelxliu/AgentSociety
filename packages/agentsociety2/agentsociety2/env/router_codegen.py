@@ -835,6 +835,9 @@ class ExactTemplateCodeProvider:
         key = (context.readonly, context.instruction_stripped)
         if key in router._exact_template_codes:
             return router._exact_template_codes[key]
+        if router._exact_template_strict:
+            # No reviewed program for this template: refuse rather than let a model write one.
+            return 'results["status"] = "fail"\nresults["reason"] = "no frozen program for this request template"\n'
         ev = router._exact_template_inflight.get(key)
         if ev is None:  # first ask with this template: it generates; others wait for it
             router._exact_template_inflight[key] = asyncio.Event()
@@ -1685,6 +1688,12 @@ class CodeGenRouter(RouterBase):
         | None = None,  # 缓存数据库目录，None 则用 {Config.HOME_DIR}/codegen_router_cache
         # (fork) exact-template code reuse, in memory for the life of this router (one run)
         exact_template_cache: bool = False,
+        # (fork) frozen programs: {template text: code} loaded at start; observe code likewise.
+        # With exact_template_strict, a template-mode ask with no program fails instead of
+        # calling the code-writing model (no model writes code during the run).
+        exact_template_programs: dict[str, str] | None = None,
+        exact_template_strict: bool = False,
+        observe_code: str | None = None,
         # Injected serializable LLM clients. See RouterBase.
         llm_clients_spec: dict[str, Any] | None = None,
     ):
@@ -1721,6 +1730,10 @@ class CodeGenRouter(RouterBase):
         self._exact_template_cache_enabled = exact_template_cache
         self._exact_template_codes: dict[tuple[bool, str], str] = {}
         self._exact_template_inflight: dict[tuple[bool, str], asyncio.Event] = {}
+        self._exact_template_strict = exact_template_strict
+        for tmpl, code in (exact_template_programs or {}).items():
+            self._exact_template_codes[(False, tmpl.strip())] = code
+        self._frozen_observe_code = observe_code
         self._template_cache_similarity_threshold = template_cache_similarity_threshold
         self._template_cache_max_size = template_cache_max_size
 
@@ -1786,6 +1799,11 @@ class CodeGenRouter(RouterBase):
             CacheCodeProvider(),
             LLMCodegenProvider(),
         ]
+
+    def export_programs(self) -> dict:
+        """(fork) The observe code and every saved template program, for review and freezing."""
+        return {"observe_code": self._observe_code,
+                "templates": {tmpl: code for (ro, tmpl), code in sorted(self._exact_template_codes.items())}}
 
     def _exec_lock_ctx(self):
         """Return the exec serialization context manager (lock or a no-op).
@@ -1911,6 +1929,9 @@ class CodeGenRouter(RouterBase):
         # 为本次模拟生成 run_id，便于在 JSONL 中区分不同次模拟
         self._run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
 
+        if self._frozen_observe_code:  # (fork) reviewed observe program; no model call
+            self._observe_code = self._frozen_observe_code
+            self._llm_code_generated = True
         # Generate code using LLM if not already done
         if not self._llm_code_generated:
             # Generate observe code using LLM (collects observe tools + narrates)

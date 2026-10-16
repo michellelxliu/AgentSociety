@@ -81,6 +81,10 @@ class EnvRouterProxy:
             ctx, instruction, readonly, template_mode, trace_id, parent_span_id
         )
 
+    async def export_programs(self) -> dict:
+        """(fork) The router's observe code and saved template programs."""
+        return await self._actor.export_programs.remote()
+
     async def get_world_description(self) -> str:
         return await self._actor.get_world_description.remote()
 
