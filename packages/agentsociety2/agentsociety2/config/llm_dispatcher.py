@@ -311,7 +311,30 @@ class AdaptiveSemaphore:
 # ═══════════════════════════════════════════════════════════
 
 
-def _build_router(base_url: str, api_key: str, model: str) -> Any:
+def _llm_provider(role: str) -> str:
+    """(fork) litellm provider for a role: ``openai`` (default, unchanged) or ``anthropic``.
+
+    ``AGENTSOCIETY_LLM_PROVIDER`` sets it for the default role (players, world
+    description); ``AGENTSOCIETY_CODER_LLM_PROVIDER`` for the coder role. Unset means
+    ``openai``: the request path is then byte-for-byte the upstream one. ``anthropic``
+    sends calls through litellm's native Anthropic provider, which returns thinking
+    text (``reasoning_content`` / ``thinking_blocks``) and supports prompt caching;
+    Anthropic's OpenAI-compatible endpoint does neither.
+    """
+    var = "AGENTSOCIETY_CODER_LLM_PROVIDER" if role == "coder" else "AGENTSOCIETY_LLM_PROVIDER"
+    value = (os.environ.get(var) or "openai").strip().lower()
+    if value not in ("openai", "anthropic"):
+        raise ValueError(f"{var}={value!r}: expected 'openai' or 'anthropic'")
+    return value
+
+
+# (fork) Prompt-cache breakpoints for the anthropic provider: the system message (tools +
+# system are the shared prefix of every call) and the last message (the growing ReAct
+# thread within a step). litellm's AnthropicCacheControlHook injects them.
+_ANTHROPIC_CACHE_POINTS = [{"location": "message", "role": "system"}, {"location": "message", "index": -1}]
+
+
+def _build_router(base_url: str, api_key: str, model: str, provider: str = "openai") -> Any:
     """Build a litellm :class:`Router` for one model from raw connection params.
 
     Takes explicit params instead of reading them from process config/env, so a
@@ -323,16 +346,13 @@ def _build_router(base_url: str, api_key: str, model: str) -> Any:
     """
     from litellm import Router
 
-    model_list = [
-        {
-            "model_name": model,
-            "litellm_params": {
-                "model": f"openai/{model}",
-                "api_key": api_key,
-                "api_base": base_url,
-            },
-        }
-    ]
+    if provider == "anthropic":
+        params: dict[str, Any] = {"model": f"anthropic/{model}", "api_key": api_key}
+        if base_url and "api.anthropic.com" not in base_url:
+            params["api_base"] = base_url  # e.g. a local stand-in server in tests
+    else:
+        params = {"model": f"openai/{model}", "api_key": api_key, "api_base": base_url}
+    model_list = [{"model_name": model, "litellm_params": params}]
     # ``cache_responses=False`` is deliberate: that flag is litellm's own
     # RESPONSE cache (it forwards ``caching=True`` to the completion), not the
     # provider's prompt-prefix cache. It is inert unless a global
@@ -469,6 +489,7 @@ def build_client_for_role(role: str) -> LLMClient:
         api_key=api_key or "",
         model_type=role,
         thinking=ThinkingSettings(**get_llm_thinking(role)),
+        provider=_llm_provider(role),
     )
 
 
@@ -569,6 +590,7 @@ class LLMClient:
     api_key: str
     model_type: str = "default"
     thinking: ThinkingSettings | None = None
+    provider: str = "openai"  # (fork) see _llm_provider
 
     def __post_init__(self) -> None:
         self._router: Any = None
@@ -586,6 +608,7 @@ class LLMClient:
             "api_key": self.api_key,
             "model_type": self.model_type,
             "thinking": self.thinking,
+            "provider": self.provider,
         }
 
     def __setstate__(self, state: dict[str, Any]) -> None:
@@ -597,6 +620,7 @@ class LLMClient:
         # ``or`` normalizes a missing/None value to the inert default so a
         # deserialized client can never crash on a missing attribute.
         self.thinking = state.get("thinking") or ThinkingSettings()
+        self.provider = state.get("provider") or "openai"
         self._router = None
         self._sem = None
         self._token_stats = {}
@@ -610,7 +634,7 @@ class LLMClient:
             loop = None
         if self._loop is loop and self._router is not None:
             return
-        self._router = _build_router(self.base_url, self.api_key, self.model_name)
+        self._router = _build_router(self.base_url, self.api_key, self.model_name, self.provider)
         initial = max(1, Config.LLM_RAY_CONCURRENCY)
         # No hard cap: AIMD probes the real API ceiling freely and backs off
         # on latency slowdown / rate-limit errors. min=1 lets it shed load
@@ -674,7 +698,9 @@ class LLMClient:
         # Deliberately NOT ``litellm.drop_params = True``: that would silently
         # swallow the parameter and the switch would appear to work while doing
         # nothing.
-        if "reasoning_effort" in merged:
+        # (fork) The anthropic provider maps reasoning_effort itself (adaptive thinking +
+        # output_config.effort); allowing it raw would also send it to the API verbatim.
+        if "reasoning_effort" in merged and self.provider != "anthropic":
             allowed = list(merged.get("allowed_openai_params") or [])
             if "reasoning_effort" not in allowed:
                 allowed.append("reasoning_effort")
@@ -727,6 +753,10 @@ class LLMClient:
         if _lp.isdigit() and int(_lp) > 0 and "logprobs" not in request_kwargs:
             request_kwargs["logprobs"] = True
             request_kwargs["top_logprobs"] = int(_lp)
+        if self.provider == "anthropic":
+            request_kwargs.setdefault("cache_control_injection_points", _ANTHROPIC_CACHE_POINTS)
+            # litellm otherwise asks for the model's maximum output (128K) on a non-streaming call.
+            request_kwargs.setdefault("max_tokens", int(os.environ.get("AGENTSOCIETY_LLM_MAX_TOKENS", "16000")))
         _call_id = uuid.uuid4().hex
         self._ensure_runtime()
         router = self._router
@@ -757,6 +787,7 @@ class LLMClient:
                     "model": effective_model, "messages": messages, "request_kwargs": request_kwargs,
                     "response": _dump, "latency_ms": latency_ms,
                     "reasoning": _msg.get("reasoning_content"),
+                    "thinking_blocks": _msg.get("thinking_blocks"),
                     "reasoning_status": "returned" if _msg.get("reasoning_content") else "none_returned",
                     "logprobs_status": "returned" if (_dump.get("choices") or [{}])[0].get("logprobs") else
                                        ("none_returned" if request_kwargs.get("logprobs") else "not_requested (endpoint unsupported)"),

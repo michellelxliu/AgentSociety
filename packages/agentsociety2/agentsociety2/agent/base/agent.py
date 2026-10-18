@@ -111,6 +111,19 @@ def _tool_call_payload(call_id: str, name: str, arguments: str) -> dict[str, Any
     }
 
 
+def _with_thinking(msg: dict[str, Any], thinking_blocks: Any) -> dict[str, Any]:
+    """(fork) Keep the provider's thinking blocks on a rebuilt assistant turn.
+
+    With thinking on, Anthropic requires the assistant turn that made a tool call to
+    be sent back with its thinking blocks, unchanged, for the rest of that tool loop
+    (litellm maps ``thinking_blocks`` on an assistant message back to Anthropic's
+    blocks). Endpoints that return none leave the message exactly as upstream builds it.
+    """
+    if thinking_blocks:
+        msg["thinking_blocks"] = [dict(b) if not isinstance(b, dict) else b for b in thinking_blocks]
+    return msg
+
+
 def _raw_assistant_message(content: str, tool_calls: Any) -> dict[str, Any]:
     """Echo a native assistant turn verbatim (ids and arguments untouched).
 
@@ -2378,6 +2391,7 @@ The constructor ``__init__`` is arg-less.
 
         content = str(getattr(message, "content", "") or "").strip()
         tool_calls = getattr(message, "tool_calls", None) or []
+        thinking_blocks = getattr(message, "thinking_blocks", None)  # (fork)
         if tool_calls:
             calls: list[tuple[str, dict[str, Any]]] = []
             call_ids: list[str] = []
@@ -2396,13 +2410,13 @@ The constructor ``__init__`` is arg-less.
                         return ReactTurn(
                             [],
                             f"invalid tool arguments for {name}: {exc}",
-                            _raw_assistant_message(content, tool_calls),
+                            _with_thinking(_raw_assistant_message(content, tool_calls), thinking_blocks),
                         )
                 if not isinstance(parsed_args, Mapping):
                     return ReactTurn(
                         [],
                         f"tool arguments for {name} must be an object",
-                        _raw_assistant_message(content, tool_calls),
+                        _with_thinking(_raw_assistant_message(content, tool_calls), thinking_blocks),
                     )
                 calls.append((name, dict(parsed_args)))
                 # Providers normally supply an id; synthesize one when they do
@@ -2414,10 +2428,10 @@ The constructor ``__init__`` is arg-less.
             )
             if error:
                 return ReactTurn(
-                    decisions, error, _raw_assistant_message(content, tool_calls)
+                    decisions, error, _with_thinking(_raw_assistant_message(content, tool_calls), thinking_blocks)
                 )
             return ReactTurn(
-                decisions, "", _decisions_assistant_message(content, decisions)
+                decisions, "", _with_thinking(_decisions_assistant_message(content, decisions), thinking_blocks)
             )
 
         # No native tool calls: try parsing tool invocations from the text
