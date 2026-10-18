@@ -1190,6 +1190,9 @@ class CodeStage:
             if retry_only
             else router._code_provider_chain
         )
+        if router._exact_template_strict:
+            # (fork) Strict: only frozen code runs. No model writes code, on any path.
+            providers = [p for p in providers if p.name != "llm"]
         for provider in providers:
             code = await provider.get_code(context, router)
             if code is not None:
@@ -1418,7 +1421,7 @@ class CodeStage:
                 "results": results,
                 "output": captured_output.getvalue(),
                 "print_outputs": [],
-                "error": str(e),
+                "error": f"{type(e).__name__}: {e}",
                 "success": False,
             }
 
@@ -1428,7 +1431,12 @@ class CodeStage:
         # <observe> / <statistics> flow through the normal codegen path using
         # the LLM-generated, init-time code from PredefinedCodeProvider
         # (_observe_code / _statistics_code). No hand-written builtin collection.
-        max_retries = router.max_llm_call_retry if context.code is None else 0
+        strict = router._exact_template_strict
+        # (fork) Strict: a frozen program that raises or times out is not retried through
+        # the code-writing model; the ask fails with the program's own error.
+        max_retries = (
+            router.max_llm_call_retry if context.code is None and not strict else 0
+        )
         while context.retry_count <= max_retries:
             if context.code is None:
                 ok = await self._acquire_code(
@@ -1439,6 +1447,13 @@ class CodeStage:
                     context.previous_errors.append("Failed to generate code from LLM.")
                     context.previous_code = None
                     if context.retry_count > max_retries:
+                        if strict:
+                            reason = "no frozen program for this request"
+                            context.early_return = (
+                                {"status": "fail", "reason": reason},
+                                f"Strict mode: {reason}.",
+                            )
+                            return context
                         context.early_return = (
                             {},
                             "Failed to generate code after retries.",
@@ -1501,6 +1516,12 @@ class CodeStage:
                 context.previous_code = code
                 context.previous_errors.append(error)
                 if context.retry_count > max_retries:
+                    if strict:
+                        context.early_return = (
+                            {"status": "fail", "reason": f"frozen program failed: {error}"},
+                            f"Strict mode: the frozen program failed: {error}",
+                        )
+                        return context
                     context.early_return = (
                         context.ctx,
                         f"Code execution failed after retries: {error}",
